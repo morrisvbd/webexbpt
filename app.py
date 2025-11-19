@@ -46,8 +46,12 @@ USER_CACHE = {
 }
 # Nu: {room_id: [ticket_id1, ticket_id2, ...]}
 USER_TICKET_MAP = {}
+# Per room per gebruiker: {room_id: {user_email_lower: [ticket_id, ...]}}
+ROOM_TICKETS_BY_USER = {}
 # Om statuswijzigingen te detecteren: {ticket_id: {status: "Oud status", last_checked: timestamp}}
 TICKET_STATUS_TRACKER = {}
+# Bijhouden van laatste verwerkte actie per ticket: {ticket_id: last_action_id}
+ACTION_TRACKER = {}
 CACHE_DURATION = 24 * 60 * 60  # 24 uur
 MAX_PAGES = 3  # Max 3 pagina's (100 + 100 + 100 = 300 users)
 
@@ -294,6 +298,91 @@ def send_adaptive_card(room_id):
     except Exception as e:
         log.error(f"❌ Adaptive card versturen mislukt: {e}")
 
+def send_reply_card(room_id, sender_email):
+    if not WEBEX_HEADERS:
+        log.error("❌ WEBEX_HEADERS is niet ingesteld")
+        return
+    tickets = ROOM_TICKETS_BY_USER.get(room_id, {}).get((sender_email or "").lower(), [])
+    choices = [{"title": f"Ticket #{t}", "value": str(t)} for t in tickets]
+    if not choices:
+        subtitle = "Ik zie nog geen tickets die aan jou gekoppeld zijn in deze ruimte."
+    else:
+        subtitle = "Kies hieronder je ticket of vul een nummer in."
+    log.info(f"➡️ Sturen reply card naar room {room_id} voor {sender_email} met {len(choices)} opties")
+    card = {
+        "roomId": room_id,
+        "text": "Reageer op een ticket",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": [
+                    {"type": "TextBlock", "text": "💬 Reageer op ticket", "weight": "bolder", "size": "medium"},
+                    {"type": "TextBlock", "text": subtitle, "wrap": True, "spacing": "small"},
+                    {"type": "Input.ChoiceSet", "id": "ticket", "label": "Jouw tickets", "choices": choices, "isMultiSelect": False, "style": "compact"},
+                    {"type": "TextBlock", "text": "Of voer handmatig een ticketnummer in:", "wrap": True, "spacing": "small"},
+                    {"type": "Input.Text", "id": "ticket_manual", "placeholder": "Bijv. 12345"},
+                    {"type": "TextBlock", "text": "Bericht (wordt als publieke note geplaatst):", "wrap": True, "spacing": "small"},
+                    {"type": "Input.Text", "id": "message", "isMultiline": True, "placeholder": "Je bericht...", "maxLength": 4000, "label": "Bericht", "required": True}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "title": "📨 Verstuur reactie", "data": {"formType": "reply", "sender": (sender_email or "").lower()}}
+                ]
+            }
+        }]
+    }
+    try:
+        requests.post("https://webexapis.com/v1/messages", headers=WEBEX_HEADERS, json=card, timeout=10)
+        log.info(f"✅ Reply card verstuurd naar room {room_id}")
+    except Exception as e:
+        log.error(f"❌ Reply card versturen mislukt: {e}")
+
+def send_my_tickets_card(room_id, sender_email):
+    if not WEBEX_HEADERS:
+        log.error("❌ WEBEX_HEADERS is niet ingesteld")
+        return
+    user_lower = (sender_email or "").lower()
+    tickets = ROOM_TICKETS_BY_USER.get(room_id, {}).get(user_lower, [])
+    items = []
+    for t in tickets:
+        status = (TICKET_STATUS_TRACKER.get(str(t)) or {}).get("status", "onbekend")
+        items.append({
+            "type": "ColumnSet",
+            "columns": [
+                {"type": "Column", "width": "auto", "items": [{"type": "TextBlock", "text": f"# {t}", "weight": "bolder"}]},
+                {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": f"Status: {status}", "wrap": True}]}
+            ]
+        })
+    if not items:
+        items = [{"type": "TextBlock", "text": "Je hebt nog geen gekoppelde tickets in deze ruimte.", "wrap": True}]
+
+    card = {
+        "roomId": room_id,
+        "text": "Jouw tickets",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": [
+                    {"type": "TextBlock", "text": "📋 Jouw tickets in deze ruimte", "weight": "bolder", "size": "medium"},
+                    {"type": "Container", "items": items, "spacing": "small"}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "title": "💬 Reageer op ticket", "data": {"formType": "openReply", "sender": user_lower}}
+                ]
+            }
+        }]
+    }
+    try:
+        requests.post("https://webexapis.com/v1/messages", headers=WEBEX_HEADERS, json=card, timeout=10)
+        log.info(f"✅ My tickets card verstuurd naar room {room_id}")
+    except Exception as e:
+        log.error(f"❌ My tickets card versturen mislukt: {e}")
+
 # --------------------------------------------------------------------------
 # HALO TICKETS
 # --------------------------------------------------------------------------
@@ -360,12 +449,143 @@ def create_halo_ticket(form, room_id):
     if room_id not in USER_TICKET_MAP:
         USER_TICKET_MAP[room_id] = []
     USER_TICKET_MAP[room_id].append(tid)
+    # Koppel ticket aan opgegeven eindgebruikers-e-mailadres in deze room
+    owner_email = (form.get("email") or "").strip().lower()
+    if owner_email:
+        ROOM_TICKETS_BY_USER.setdefault(room_id, {}).setdefault(owner_email, []).append(tid)
     
     TICKET_STATUS_TRACKER[tid] = {"status": current_status, "last_checked": time.time()}
+    # Initialiseer ACTION_TRACKER op huidige hoogste action-id zodat we geen oude acties posten
+    try:
+        latest_actions = get_actions_for_ticket(int(tid), None)
+        if latest_actions:
+            last = latest_actions[-1]
+            ACTION_TRACKER[str(tid)] = int(last.get("_id_int", last.get("id", 0)) or 0)
+    except Exception as e:
+        log.warning(f"⚠️ Kon initiële Actions niet ophalen voor ticket {tid}: {e}")
     
     send_message(room_id, f"✅ Ticket aangemaakt: **{tid}**")
     log.info(f"✅ Ticket {tid} toegevoegd aan room {room_id}")
     return tid
+
+# -------------------------------------------------------------------------- 
+# HALO ACTIONS POLLING (statuswijzigingen + agent notes)
+# -------------------------------------------------------------------------- 
+def get_actions_for_ticket(ticket_id, last_seen_action_id):
+    """Haalt Actions op voor één ticket. Filtert niets uit zodat systeem- en privé-acties zichtbaar zijn.
+    Retourneert op id gesorteerde lijst en respecteert last_seen_action_id indien opgegeven.
+    """
+    h = get_halo_headers()
+    params = {
+        "ticket_id": int(ticket_id),
+        "count": 50,
+        "includehtmlnote": True,
+        "includeattachments": True,
+        # Belangrijk: GEEN excludesys / excludeprivate / agentonly / conversationonly / emailonly / slaonly
+    }
+    url = f"{HALO_API_BASE}/api/Actions"
+    r = halo_request(url, headers=h, params=params)
+    if r.status_code != 200:
+        log.warning(f"⚠️ Actions ophalen voor ticket {ticket_id} gaf {r.status_code}: {r.text[:200]}")
+        return []
+    data = r.json()
+    # Accepteer meerdere mogelijke containers
+    actions = []
+    if isinstance(data, list):
+        actions = data
+    elif isinstance(data, dict):
+        actions = data.get("root") or data.get("actions") or data.get("items") or []
+    
+    # Normaliseer id naar int en sorteer
+    norm_actions = []
+    for a in actions:
+        try:
+            a_id = int(a.get("id") or a.get("ActionId") or a.get("action_id") or 0)
+        except Exception:
+            a_id = 0
+        a["_id_int"] = a_id
+        norm_actions.append(a)
+    norm_actions.sort(key=lambda x: x.get("_id_int", 0))
+    
+    if last_seen_action_id is not None:
+        norm_actions = [a for a in norm_actions if a.get("_id_int", 0) > int(last_seen_action_id)]
+    return norm_actions
+
+def _extract_status_change(action: dict):
+    # Zoek diverse veldnamen voor status van/naar
+    old_s = action.get("statusfrom") or action.get("status_from") or action.get("oldstatus") or action.get("fromstatus")
+    new_s = action.get("statusto") or action.get("status_to") or action.get("newstatus") or action.get("tostatus")
+    # Soms zitten de namen in sub-objecten
+    if isinstance(action.get("status"), dict):
+        new_s = new_s or action["status"].get("name")
+    return old_s, new_s
+
+def classify_action_to_message(ticket_id, action):
+    """Maakt een Webex-bericht o.b.v. een action. Geeft None terug als we het negeren."""
+    a_type = (action.get("type") or action.get("actiontype") or action.get("ActionType") or "").lower()
+    a_note_html = action.get("htmlbody") or action.get("notehtml") or action.get("notebody") or action.get("body") or action.get("outcome")
+    is_private = bool(action.get("private") or action.get("isprivate") or action.get("private_note"))
+
+    # 1) Statuswijziging (system action)
+    old_s, new_s = _extract_status_change(action)
+    if ("status" in a_type) or new_s:
+        if isinstance(new_s, (int, str)) and str(new_s).isdigit():
+            new_s = get_status_name(int(new_s))
+        if isinstance(old_s, (int, str)) and str(old_s).isdigit():
+            old_s = get_status_name(int(old_s))
+        old_s = old_s or "onbekend"
+        new_s = new_s or "onbekend"
+        return f"⚠️ Statuswijziging voor ticket #{ticket_id}: {old_s} → {new_s}"
+
+    # 2) Agent note (privé of publiek)
+    if ("note" in a_type) or a_note_html:
+        author = action.get("agentname") or action.get("createdby") or action.get("author") or "Agent"
+        visibility = "(privé) " if is_private else ""
+        content = (a_note_html or "").strip()
+        if not content:
+            return None
+        return f"📝 {visibility}Nieuwe agent note van {author} op ticket #{ticket_id}:\n{content}"
+
+    # Andere types (email, sla-hold, etc.) negeren voorlopig
+    return None
+
+def check_ticket_actions():
+    # Verzamel unieke ticket-ids uit alle rooms
+    all_ticket_ids = set()
+    for tickets in USER_TICKET_MAP.values():
+        for t in tickets:
+            all_ticket_ids.add(str(t))
+    if not all_ticket_ids:
+        return
+
+    for tid in list(all_ticket_ids):
+        last_seen = ACTION_TRACKER.get(str(tid))
+        try:
+            actions = get_actions_for_ticket(int(tid), last_seen)
+        except Exception as e:
+            log.error(f"❌ Fout bij ophalen Actions voor ticket {tid}: {e}")
+            continue
+
+        if not actions:
+            continue
+
+        # Bepaal hoogste id en verwerk berichten
+        max_id = last_seen or 0
+        for a in actions:
+            a_id = a.get("_id_int", 0)
+            msg = classify_action_to_message(str(tid), a)
+            if msg:
+                # Zoek passende room
+                room_id = None
+                for rid, tickets in USER_TICKET_MAP.items():
+                    if str(tid) in tickets:
+                        room_id = rid
+                        break
+                if room_id:
+                    send_message(room_id, msg)
+            if a_id > max_id:
+                max_id = a_id
+        ACTION_TRACKER[str(tid)] = int(max_id)
 
 # -------------------------------------------------------------------------- 
 # PUBLIC NOTE FUNCTIE (CORRECTE IMPLEMENTATIE)
@@ -466,6 +686,39 @@ def process_webex_event(payload):
             log.info("❌ Bericht is van de bot zelf, negeren")
             return
         
+        # Trigger voor keuze-kaart om een ticket te selecteren
+        triggers = ["reageer", "reactie", "reply", "note", "notitie", "kies ticket"]
+        if any(t in text.lower() for t in triggers):
+            send_reply_card(room_id, sender)
+            return
+
+        # Toon kaart met eigen tickets
+        if any(t in text.lower() for t in ["mijn tickets", "tickets", "lijst", "overzicht"]):
+            send_my_tickets_card(room_id, sender)
+            return
+
+        # Help / menu
+        if any(t == text.lower().strip() for t in ["help", "?", "menu"]):
+            send_message(
+                room_id,
+                """
+                **🚀 Webex Halo bot — snelle hulp**
+                - Typ `nieuwe melding` om een ticket aan te maken
+                - Typ `reageer` om een ticket te kiezen en een reactie te sturen
+                - Typ `mijn tickets` voor een overzicht van jouw tickets
+                - Typ `link #12345` om een bestaand ticket aan jezelf te koppelen
+                - Typ `Ticket #12345 jouw bericht` om direct te reageren op dat ticket
+                """
+            )
+            return
+
+        # Link bestaand ticket aan afzender: "link #12345" of "koppel #12345"
+        m_link = re.search(r"(?:link|koppel)\s*#?(\d+)", text.lower())
+        if m_link:
+            link_tid = m_link.group(1)
+            link_ticket_to_user(room_id, sender, link_tid)
+            return
+
         if "nieuwe melding" in text.lower():
             log.info("ℹ️ Bericht bevat 'nieuwe melding', stuur adaptive card")
             send_message(room_id, "👋 Hi! Je hebt 'nieuwe melding' gestuurd. Klik op de knop hieronder om een ticket aan te maken:\n\n"
@@ -477,35 +730,76 @@ def process_webex_event(payload):
         if ticket_match:
             requested_tid = ticket_match.group(1)
             log.info(f"ℹ️ Bericht bevat ticket #{requested_tid}")
-            
-            if room_id in USER_TICKET_MAP and requested_tid in USER_TICKET_MAP[room_id]:
-                log.info(f"✅ Ticket #{requested_tid} gevonden in room {room_id}")
+            # Alleen toestaan als dit ticket aan afzender gekoppeld is binnen deze room
+            sender_email = (sender or "").strip().lower()
+            allowed = False
+            if room_id in ROOM_TICKETS_BY_USER and sender_email in ROOM_TICKETS_BY_USER[room_id]:
+                allowed = requested_tid in ROOM_TICKETS_BY_USER[room_id][sender_email]
+            if not allowed and room_id in USER_TICKET_MAP:
+                # Fallback: als we nog geen per-gebruiker mapping hebben, val terug op oude lijst
+                allowed = requested_tid in USER_TICKET_MAP[room_id]
+
+            if allowed:
+                log.info(f"✅ Ticket #{requested_tid} toegestaan voor afzender {sender_email} in room {room_id}")
                 success = add_public_note(requested_tid, text)
                 if success:
-                    send_message(room_id, f"📝 Bericht toegevoegd aan Halo ticket #{requested_tid}.")
+                    send_message(room_id, f"📝 Bericht toegevoegd aan jouw ticket #{requested_tid}.")
                 else:
                     send_message(room_id, f"❌ Kan geen notitie toevoegen aan ticket #{requested_tid}. Probeer het opnieuw.")
             else:
-                log.info(f"❌ Ticket #{requested_tid} bestaat niet in deze room")
-                send_message(room_id, f"❌ Ticket #{requested_tid} bestaat niet in deze room of is niet gekoppeld aan deze room.")
+                log.info(f"❌ Ticket #{requested_tid} is niet gekoppeld aan afzender {sender_email} in deze room")
+                send_message(room_id, f"❌ Ticket #{requested_tid} is niet gekoppeld aan jou in deze room.")
         else:
-            log.info("ℹ️ Geen specifiek ticketnummer in bericht, voeg toe aan alle tickets in de room")
-            if room_id in USER_TICKET_MAP:
-                for tid in USER_TICKET_MAP[room_id]:
+            # Geen ticketnummer: voeg alleen toe aan tickets van de afzender in deze room
+            sender_email = (sender or "").strip().lower()
+            user_tickets = ROOM_TICKETS_BY_USER.get(room_id, {}).get(sender_email, [])
+            if user_tickets:
+                errors = 0
+                for tid in user_tickets:
                     success = add_public_note(tid, text)
                     if not success:
-                        log.error(f"❌ Notitie toevoegen aan ticket {tid} mislukt")
-                send_message(room_id, f"📝 Bericht toegevoegd aan alle jouw tickets in deze room.")
+                        errors += 1
+                if errors:
+                    send_message(room_id, f"⚠️ Bericht toegevoegd aan {len(user_tickets)-errors} van jouw tickets; {errors} mislukt.")
+                else:
+                    send_message(room_id, f"📝 Bericht toegevoegd aan jouw {len(user_tickets)} ticket(s) in deze room.")
             else:
-                send_message(room_id, "ℹ️ Geen tickets gevonden in deze room. Stuur 'nieuwe melding' om een ticket aan te maken.")
+                send_message(room_id, "ℹ️ Ik vond geen tickets die aan jou gekoppeld zijn in deze room. Voeg 'Ticket #<nummer>' toe of maak eerst een ticket aan.")
     elif res == "attachmentActions":
         a_id = payload["data"]["id"]
         log.info(f"📩 Verwerken attachmentActions: id={a_id}")
-        inputs = requests.get(f"https://webexapis.com/v1/attachment/actions/{a_id}",
-                              headers=WEBEX_HEADERS).json().get("inputs", {})
+        action_payload = requests.get(f"https://webexapis.com/v1/attachment/actions/{a_id}",
+                              headers=WEBEX_HEADERS).json()
+        inputs = action_payload.get("inputs", {})
         room_id = payload["data"]["roomId"]
         log.info(f"📩 attachmentActions in room {room_id} met inputs: {json.dumps(inputs, indent=2)}")
-        create_halo_ticket(inputs, room_id)
+        form_type = (inputs.get("formType") or inputs.get("form_type") or "").lower()
+        if form_type == "reply":
+            # Reply form afhandelen
+            sender = (inputs.get("sender") or "").lower()
+            selected = (inputs.get("ticket") or "").strip()
+            manual = (inputs.get("ticket_manual") or "").strip()
+            message = (inputs.get("message") or "").strip()
+            tid = manual if manual else selected
+            if not (tid and tid.isdigit()):
+                send_message(room_id, "❌ Geen geldig ticketnummer opgegeven.")
+                return
+            # Controleer of ticket aan afzender gekoppeld is
+            allowed = tid in ROOM_TICKETS_BY_USER.get(room_id, {}).get(sender, [])
+            if not allowed:
+                send_message(room_id, f"❌ Ticket #{tid} is niet aan jou gekoppeld in deze room.")
+                return
+            ok = add_public_note(tid, message)
+            if ok:
+                send_message(room_id, f"📝 Reactie geplaatst op ticket #{tid}.")
+            else:
+                send_message(room_id, f"❌ Reactie plaatsen op ticket #{tid} mislukt.")
+        elif form_type == "openReply":
+            sender = (inputs.get("sender") or "").lower()
+            send_reply_card(room_id, sender)
+        else:
+            # Default: oude kaart voor nieuw ticket
+            create_halo_ticket(inputs, room_id)
     else:
         log.info(f"ℹ️ Onbekende resource type: {res}")
 
@@ -635,7 +929,8 @@ def initialize():
         log.error("❌ WEBEX_HEADERS is niet ingesteld")
         return {"status": "error", "message": "WEBEX_BOT_TOKEN is niet ingesteld"}
     get_users()
-    threading.Thread(target=status_check_loop, daemon=True).start()
+    # Gebruik Actions-polling als primaire updatebron
+    threading.Thread(target=action_check_loop, daemon=True).start()
     return {
         "status": "initialized",
         "source": f"client{HALO_CLIENT_ID_NUM}_site{HALO_SITE_ID}",
@@ -650,6 +945,87 @@ def status_check_loop():
         except Exception as e:
             log.error(f"💥 Fout bij status check loop: {e}")
             time.sleep(60)
+
+def action_check_loop():
+    while True:
+        try:
+            check_ticket_actions()
+            # Iets sneller dan status-check zodat notes vlot doorkomen
+            time.sleep(30)
+        except Exception as e:
+            log.error(f"💥 Fout bij actions check loop: {e}")
+            time.sleep(30)
+
+# -------------------------------------------------------------------------- 
+# LINK BESTAAND TICKET AAN GEBRUIKER IN ROOM
+# -------------------------------------------------------------------------- 
+def fetch_ticket_details(ticket_id):
+    h = get_halo_headers()
+    url = f"{HALO_API_BASE}/api/Tickets/{ticket_id}"
+    r = halo_request(url, headers=h, params={"includedetails": True})
+    if r.status_code != 200:
+        raise RuntimeError(f"Ticket {ticket_id} ophalen mislukt: {r.status_code}")
+    return r.json()
+
+def _extract_ticket_status(ticket_data):
+    current_status = ticket_data.get("Status") or \
+                     ticket_data.get("status") or \
+                     ticket_data.get("StatusName") or \
+                     ticket_data.get("status_name") or \
+                     ticket_data.get("StatusID") or \
+                     (ticket_data.get("ticket_status") or {}).get("name") or \
+                     (ticket_data.get("status") or {}).get("name") or \
+                     (ticket_data.get("status") or {}).get("status") or \
+                     "Unknown"
+    if isinstance(current_status, int) or (isinstance(current_status, str) and str(current_status).isdigit()):
+        current_status = get_status_name(current_status)
+    return current_status
+
+def _ticket_belongs_to_user(ticket_data, user_obj, sender_email_lower):
+    # 1) Matching user id
+    t_uid = ticket_data.get("user_id") or ticket_data.get("UserID") or ticket_data.get("userid")
+    if t_uid and user_obj and int(t_uid) == int(user_obj.get("id")):
+        return True
+    # 2) Matching email
+    possible_emails = [
+        ticket_data.get("user", {}).get("emailaddress") if isinstance(ticket_data.get("user"), dict) else None,
+        ticket_data.get("UserEmail"), ticket_data.get("EmailAddress"), ticket_data.get("emailaddress"),
+        ticket_data.get("useremail"), ticket_data.get("user_email"),
+    ]
+    possible_emails = [e.lower() for e in possible_emails if isinstance(e, str)]
+    return sender_email_lower in possible_emails
+
+def link_ticket_to_user(room_id, sender_email, ticket_id):
+    sender_lower = (sender_email or "").strip().lower()
+    try:
+        user_obj = get_user(sender_lower)
+        if not user_obj:
+            send_message(room_id, "❌ Ik vond jouw gebruiker niet in Halo op basis van je e-mailadres.")
+            return
+        tdata = fetch_ticket_details(ticket_id)
+        if not _ticket_belongs_to_user(tdata, user_obj, sender_lower):
+            send_message(room_id, f"❌ Ticket #{ticket_id} lijkt niet van jou te zijn.")
+            return
+        # Registreer mapping
+        ROOM_TICKETS_BY_USER.setdefault(room_id, {}).setdefault(sender_lower, [])
+        if str(ticket_id) not in ROOM_TICKETS_BY_USER[room_id][sender_lower]:
+            ROOM_TICKETS_BY_USER[room_id][sender_lower].append(str(ticket_id))
+        USER_TICKET_MAP.setdefault(room_id, [])
+        if str(ticket_id) not in USER_TICKET_MAP[room_id]:
+            USER_TICKET_MAP[room_id].append(str(ticket_id))
+        # Status tracker
+        TICKET_STATUS_TRACKER[str(ticket_id)] = {"status": _extract_ticket_status(tdata), "last_checked": time.time()}
+        # Action tracker op laatst bekende actie zetten
+        try:
+            latest = get_actions_for_ticket(int(ticket_id), None)
+            if latest:
+                ACTION_TRACKER[str(ticket_id)] = int(latest[-1].get("_id_int", latest[-1].get("id", 0)) or 0)
+        except Exception as e:
+            log.warning(f"⚠️ Kon Actions voor ticket {ticket_id} niet initialiseren: {e}")
+        send_message(room_id, f"🔗 Ticket #{ticket_id} is gekoppeld aan jou in deze ruimte. Je ontvangt updates en kunt nu reageren.")
+    except Exception as e:
+        log.error(f"❌ Linken van ticket {ticket_id} mislukt: {e}")
+        send_message(room_id, f"❌ Linken van ticket #{ticket_id} is mislukt.")
 
 # -------------------------------------------------------------------------- 
 # START
